@@ -1,8 +1,8 @@
-c3ef77a0f47a1fa1ec3e8453929fa368 *DESCRIPTION
+4f87f6c313e3c8e9a7b16d8b9d2ed5f6 *DESCRIPTION
 8ca540e145360b5d42b84e9bc311e148 *LICENSE
 2853eabb104c30b1e8175d0dd29d6f57 *NAMESPACE
-27e2daa114e35e5eddaf440f85a5c3a1 *R/model_functions.R
-64b7b40e6947ad39f69f12ec390fc340 *R/zzz.R
+76e0d0cd1b49854f8cdd05e03918d3bb *R/model_functions.R
+81413bfb577a2c7f2d40ec30f0287481 *R/zzz.R
 b7d1138ee106c6ee4912bb1b0bb5020d *inst/examples/compare_direct.R
 d647cc9751653ef1091d2a3e0221cb57 *inst/examples/predict_livertests.R
 9b494de61fa9e9bb70f374173305963d *inst/models/rinet_1d.keras
