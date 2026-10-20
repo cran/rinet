@@ -4,96 +4,70 @@ NULL
 # Internal environment to cache loaded models
 .models <- new.env(parent = emptyenv())
 
-# Internal helper to silence TensorFlow/keras chatter (stdout/stderr/messages)
-.silence_tf <- function(expr) {
-  # R-level silencing
-  tf_log <- file(tempfile(), open = "w")
-  on.exit({
-    sink(NULL, type = "message")
-    sink(NULL, type = "output")
-    close(tf_log)
-  }, add = TRUE)
-  sink(tf_log, type = "message")
-  sink(tf_log, type = "output")
-  
-  # C-level silencing via Python if available
-  if (reticulate::py_available()) {
-    tryCatch({
-      reticulate::py_run_string("import os; _orig_stderr = os.dup(2); _devnull = os.open(os.devnull, os.O_WRONLY); os.dup2(_devnull, 2)")
-      on.exit({
-        reticulate::py_run_string("os.dup2(_orig_stderr, 2); os.close(_orig_stderr); os.close(_devnull)")
-      }, add = TRUE)
-    }, error = function(e) {})
-  }
-
-  withCallingHandlers(expr,
-    warning = function(w) invokeRestart("muffleWarning"),
-    message = function(m) invokeRestart("muffleMessage")
+# RobustScaler parameters exported from the scikit-learn scalers used during
+# training (see data-raw/convert_keras_to_torchscript.py). Inverse transform
+# is x * scale + center. Keyed by "<ndim>d_<model version>".
+.scaler_params <- list(
+  `1d_v2.0` = list(
+    center = c(0.0002047170471470941, 0.5857798250435453, 0.7463246324632463),
+    scale  = c(0.3005987030854761, 0.22441810400917267, 0.19519641289267498)
+  ),
+  `1d_v2.1` = list(
+    center = c(-0.0019110005908701852, 0.45092418458886824, 0.7404809619238477),
+    scale  = c(0.4277205806273689, 0.25229529693014174, 0.19751203308250287)
+  ),
+  `2d_v2.0` = list(
+    center = c(-0.002805449917321084, -0.0017991409067919127, 0.671630399121245,
+               0.6709800895332179, 0.005727785563162169, 0.7417417417417418),
+    scale  = c(0.1922681733638529, 0.19147688428607332, 0.19244703060204937,
+               0.1943684586844019, 0.806204029253837, 0.19475599152659384)
   )
-}
+)
 
-#' Internal function to load model and scaler
+#' Internal function to load the TorchScript model
 #' @keywords internal
-.load_model <- function(ndim) {
-  model_key <- paste0("model_", ndim, "d")
-  
+.load_model <- function(ndim, version) {
+  model_key <- paste0(ndim, "d_", version)
+
   if (is.null(.models[[model_key]])) {
-    # Ensure TensorFlow is initialized
-    if (!reticulate::py_module_available("tensorflow")) {
-      stop("TensorFlow is not available. Please install TensorFlow:\n",
-           "  library(keras)\n",
-           "  install_keras()")
-    }
-    helpers <- tryCatch(get(".py_silence", envir = parent.env(environment()), inherits = TRUE), error = function(e) NULL)
-    
-    model_file <- paste0("rinet_", ndim, "d.keras")
+    model_file <- paste0("rinet_", model_key, ".pt")
     model_path <- system.file("models", model_file, package = "rinet")
-    
+
     if (!file.exists(model_path)) {
-      stop("Model file not found: ", model_path, 
+      stop("Model file not found: ", model_path,
            "\nMake sure ", model_file, " is in inst/models/")
     }
-    
-    message("Loading ", ndim, "D model (this may take a moment on first use)...")
-    keras <- reticulate::import("keras")
-    .models[[model_key]] <- keras$models$load_model(model_path)
-    message("Model loaded.")
+
+    model <- tryCatch(
+      torch::jit_load(model_path),
+      error = function(e) {
+        stop("Could not load the RINet model. If this is a fresh install, ",
+             "complete the one-time setup with:\n",
+             "  torch::install_torch()\n\n",
+             "Original error: ", conditionMessage(e), call. = FALSE)
+      }
+    )
+    .models[[model_key]] <- model
   }
-  
+
   return(.models[[model_key]])
 }
 
-#' Internal function to load scaler
+#' Internal function to invert the training-time output scaling
 #' @keywords internal
-.load_scaler <- function(ndim) {
-  scaler_key <- paste0("scaler_", ndim, "d")
-  
-  if (is.null(.models[[scaler_key]])) {
-    scaler_file <- paste0("scaler_", ndim, "d.pkl")
-    scaler_path <- system.file("models", scaler_file, package = "rinet")
-    
-    if (!file.exists(scaler_path)) {
-      stop("Scaler file not found: ", scaler_path,
-           "\nMake sure ", scaler_file, " is in inst/models/")
-    }
-    
-    .silence_tf({
-      reticulate::py_run_string("import pickle")
-      .models[[scaler_key]] <- reticulate::py_run_string(
-        sprintf("scaler = pickle.load(open('%s', 'rb'))", scaler_path)
-      )$scaler
-    })
-  }
-  
-  return(.models[[scaler_key]])
+.inverse_transform <- function(predictions, ndim, version) {
+  p <- .scaler_params[[paste0(ndim, "d_", version)]]
+  sweep(sweep(predictions, 2, p$scale, "*"), 2, p$center, "+")
 }
 
 #' Extract histogram features from standardized data
 #' @keywords internal
-.extract_features <- function(data, ndim, feature_grid_range = c(-4, 4), 
+.extract_features <- function(data, ndim, feature_grid_range = c(-4, 4),
                               feature_grid_nbins = 100) {
   data <- as.matrix(data)
-  
+  breaks <- seq(feature_grid_range[1], feature_grid_range[2],
+                length.out = feature_grid_nbins + 1)
+
   if (ndim == 1) {
     # Check for standardization (using population SD to match Python)
     n <- length(data)
@@ -101,15 +75,15 @@ NULL
     if (abs(mean(data)) > 0.01 || abs(pop_sd - 1) > 0.01) {
       stop("Data must be standardized (mean=0, sd=1)")
     }
-    
-    # Create histogram using numpy for consistency with Python/2D
-    breaks <- seq(feature_grid_range[1], feature_grid_range[2], 
-                  length.out = feature_grid_nbins + 1)
-    np <- reticulate::import("numpy", convert = FALSE)
-    hist_result <- np$histogram(data, bins = breaks, density = TRUE)
-    # Use [[0]] to get the first element (counts) from the Python tuple
-    features <- as.numeric(reticulate::py_to_r(hist_result[[0]]))
-    
+
+    # density-normalized histogram counts, matching numpy's histogram(..., density=TRUE);
+    # values outside the grid are dropped (hist() would error on them)
+    nbins <- feature_grid_nbins
+    ix <- findInterval(data, breaks, rightmost.closed = TRUE)
+    counts <- tabulate(ix[ix >= 1 & ix <= nbins], nbins = nbins)
+    bin_width <- diff(breaks)
+    features <- counts / (sum(counts) * bin_width)
+
   } else if (ndim == 2) {
     # Check for standardization (using population SD to match Python)
     n <- nrow(data)
@@ -117,25 +91,22 @@ NULL
     if (any(abs(colMeans(data)) > 0.01) || any(abs(pop_sd - 1) > 0.01)) {
       stop("Data must be standardized (mean=0, sd=1 for each dimension)")
     }
-    
-    # Create 2D histogram
-    breaks <- seq(feature_grid_range[1], feature_grid_range[2], 
-                  length.out = feature_grid_nbins + 1)
-    
-    # Use reticulate to call numpy's histogram2d for consistency
-    np <- reticulate::import("numpy", convert = FALSE)
-    hist_result <- np$histogram2d(
-      data[, 1], data[, 2],
-      bins = breaks,
-      density = TRUE
-    )
-    # Use [[0]] to get the first element (H) from the Python tuple
-    features <- as.matrix(reticulate::py_to_r(hist_result[[0]]))
+
+    # 2D histogram, matching numpy's histogram2d(..., density=TRUE)
+    ix <- findInterval(data[, 1], breaks, rightmost.closed = TRUE)
+    iy <- findInterval(data[, 2], breaks, rightmost.closed = TRUE)
+    nbins <- feature_grid_nbins
+    keep <- ix >= 1 & ix <= nbins & iy >= 1 & iy <= nbins
+    counts <- matrix(0, nrow = nbins, ncol = nbins)
+    tab <- table(factor(ix[keep], levels = 1:nbins), factor(iy[keep], levels = 1:nbins))
+    counts[] <- as.matrix(tab)
+    bin_area <- (diff(feature_grid_range) / nbins)^2
+    features <- counts / (sum(counts) * bin_area)
   }
-  
+
   # Normalize to [0, 1]
   features <- (features - min(features)) / (max(features) - min(features))
-  
+
   return(features)
 }
 
@@ -154,6 +125,10 @@ NULL
 #' It estimates the statistics of a "healthy" reference population from a
 #' mixture of healthy and pathological measurements.
 #'
+#' @section Setup:
+#' The models run on the torch backend, which is downloaded separately from
+#' the package. Run \code{torch::install_torch()} once after installing rinet.
+#'
 #' @param data A numeric vector, matrix, or list. For 1D: vector or matrix with
 #'   1 column. For 2D: matrix with 2 columns. Can also be a list of such objects.
 #' @param feature_grid_range Numeric vector of length 2 specifying the range
@@ -171,6 +146,10 @@ NULL
 #'   intervals are computed for all predicted statistics using batch inference.
 #' @param confidence_level Numeric specifying the confidence level for bootstrap
 #'   intervals. Default is 0.95.
+#' @param model_version Version of the 1D model: \code{"v2.1"} (default) or
+#'   \code{"v2.0"}, the model described in the published paper. Only applies to
+#'   1D data; 2D predictions always use the v2.0 model. See the package NEWS for
+#'   the differences between versions.
 #' @return A list of predictions. Each element contains:
 #'   \item{mean}{Predicted mean(s) (log-scale if log_scale=TRUE)}
 #'   \item{std}{Predicted standard deviation(s) (log-scale if log_scale=TRUE)}
@@ -179,6 +158,7 @@ NULL
 #'   \item{reference_fraction}{Predicted reference component fraction}
 #'   \item{reference_interval}{Reference interval in original scale (if log_scale=TRUE)}
 #'   \item{log_scale}{Logical indicating whether log-scaling was used}
+#'   \item{model_version}{Version of the model that produced the prediction}
 #'   \item{bootstrap_ci}{List of bootstrap confidence intervals (if n_bootstrap > 0)}
 #' @export
 #' @examples
@@ -195,11 +175,17 @@ NULL
 #'   samples <- list(exp(rnorm(1000, mean = 2, sd = 0.5)),
 #'                   exp(rnorm(1000, mean = 2, sd = 0.5)))
 #'   results <- predict_rinet(samples)
+#'
+#'   # Reproduce the published paper's 1D model
+#'   result <- predict_rinet(sample_1d, model_version = "v2.0")
 #' }
 predict_rinet <- function(data, feature_grid_range = c(-4, 4),
                           feature_grid_nbins = 100, verbose = 0,
                           log_scale = TRUE, percentiles = c(0.025, 0.975),
-                          n_bootstrap = 0, confidence_level = 0.95) {
+                          n_bootstrap = 0, confidence_level = 0.95,
+                          model_version = c("v2.1", "v2.0")) {
+  model_version <- match.arg(model_version)
+
   # Determine dimensionality from first sample
   if (is.list(data) && !is.data.frame(data)) {
     sample <- data[[1]]
@@ -227,7 +213,8 @@ predict_rinet <- function(data, feature_grid_range = c(-4, 4),
   # Call appropriate function
   if (ndim == 1) {
     return(predict_rinet_1d(data, feature_grid_range, feature_grid_nbins, verbose,
-                           log_scale, percentiles, n_bootstrap, confidence_level))
+                           log_scale, percentiles, n_bootstrap, confidence_level,
+                           model_version))
   } else {
     return(predict_rinet_2d(data, feature_grid_range, feature_grid_nbins, verbose,
                            log_scale, percentiles, n_bootstrap, confidence_level))
@@ -257,6 +244,9 @@ predict_rinet <- function(data, feature_grid_range = c(-4, 4),
 #'   intervals are computed for all predicted statistics.
 #' @param confidence_level Numeric specifying the confidence level for bootstrap
 #'   intervals. Default is 0.95.
+#' @param model_version Version of the 1D model: \code{"v2.1"} (default) or
+#'   \code{"v2.0"}, the model described in the published paper. See the package
+#'   NEWS for the differences between versions.
 #' @return A list of predictions. Each element contains:
 #'   \item{mean}{Predicted mean (scalar, log-scale if log_scale=TRUE)}
 #'   \item{std}{Predicted standard deviation (scalar, log-scale if log_scale=TRUE)}
@@ -265,6 +255,7 @@ predict_rinet <- function(data, feature_grid_range = c(-4, 4),
 #'   \item{reference_fraction}{Predicted reference component fraction}
 #'   \item{reference_interval}{Reference interval in original scale (if log_scale=TRUE)}
 #'   \item{log_scale}{Logical indicating whether log-scaling was used}
+#'   \item{model_version}{Version of the model that produced the prediction}
 #'   \item{bootstrap_ci}{List of bootstrap confidence intervals (if n_bootstrap > 0):
 #'     mean_ci, std_ci, reference_fraction_ci, reference_interval_lower_ci,
 #'     reference_interval_upper_ci}
@@ -283,7 +274,10 @@ predict_rinet <- function(data, feature_grid_range = c(-4, 4),
 predict_rinet_1d <- function(data, feature_grid_range = c(-4, 4),
                              feature_grid_nbins = 100, verbose = 0,
                              log_scale = TRUE, percentiles = c(0.025, 0.975),
-                             n_bootstrap = 0, confidence_level = 0.95) {
+                             n_bootstrap = 0, confidence_level = 0.95,
+                             model_version = c("v2.1", "v2.0")) {
+  model_version <- match.arg(model_version)
+
   # Convert to list if single sample
   if (!is.list(data) || is.data.frame(data)) {
     data <- list(as.vector(as.matrix(data)))
@@ -300,10 +294,8 @@ predict_rinet_1d <- function(data, feature_grid_range = c(-4, 4),
     })
   }
 
-  # Load model and scaler
-  model <- .load_model(1)
-  scaler <- .load_scaler(1)
-  np <- reticulate::import("numpy", convert = FALSE)
+  # Load model
+  model <- .load_model(1, model_version)
 
   # Helper function to compute population SD
   pop_sd <- function(x) {
@@ -367,25 +359,16 @@ predict_rinet_1d <- function(data, feature_grid_range = c(-4, 4),
     all_stds <- stds
   }
 
-  # Stack and add channel dimension for batch prediction
-  features_array <- np$stack(all_features, axis = 0L)
-  features_array <- np$expand_dims(features_array, axis = -1L)
+  # Stack into (N, 1, L) for the model (channels-first)
+  features_mat <- do.call(rbind, all_features)
+  features_array <- torch::torch_tensor(features_mat, dtype = torch::torch_float32())$unsqueeze(2)
 
   # Predict (single batch call for all samples + bootstraps)
-  predictions <- NULL
-  helpers <- tryCatch(get(".py_silence", envir = parent.env(environment()), inherits = TRUE), error = function(e) NULL)
-  if (!is.null(helpers)) {
-    predictions <- tryCatch(
-      helpers$predict_silent(model, features_array, verbose = verbose),
-      error = function(e) NULL
-    )
-  }
-  if (is.null(predictions)) {
-    predictions <- .silence_tf(model$predict(features_array, verbose = verbose))
-  }
+  predictions <- torch::with_no_grad(model(features_array))
+  predictions <- as.matrix(predictions)
 
-  # Inverse transform using scaler
-  predictions <- reticulate::py_to_r(scaler$inverse_transform(predictions))
+  # Inverse transform using scaler parameters
+  predictions <- .inverse_transform(predictions, 1, model_version)
 
   # Helper to compute scaled results from raw predictions
   compute_result <- function(pred_row, m, s) {
@@ -424,7 +407,8 @@ predict_rinet_1d <- function(data, feature_grid_range = c(-4, 4),
       correlation = NA,
       reference_fraction = res$reference_fraction,
       reference_interval = res$reference_interval,
-      log_scale = log_scale
+      log_scale = log_scale,
+      model_version = model_version
     )
 
     # Add bootstrap CIs if requested
@@ -492,6 +476,7 @@ predict_rinet_1d <- function(data, feature_grid_range = c(-4, 4),
 #'   \item{reference_fraction}{Predicted reference component fraction}
 #'   \item{reference_interval}{Reference region ellipse vertices (100x2 matrix) in original scale (if log_scale=TRUE)}
 #'   \item{log_scale}{Logical indicating whether log-scaling was used}
+#'   \item{model_version}{Version of the model that produced the prediction (always "v2.0" for 2D)}
 #'   \item{bootstrap_ci}{List of bootstrap confidence intervals (if n_bootstrap > 0):
 #'     mean_ci (2x2 matrix), std_ci (2x2 matrix), correlation_ci, reference_fraction_ci}
 #' @export
@@ -536,10 +521,9 @@ predict_rinet_2d <- function(data, feature_grid_range = c(-4, 4),
     stop("All samples must have 2 columns for 2D prediction")
   }
 
-  # Load model and scaler
-  model <- .load_model(2)
-  scaler <- .load_scaler(2)
-  np <- reticulate::import("numpy", convert = FALSE)
+  # Load model (only one 2D model version exists)
+  model_version <- "v2.0"
+  model <- .load_model(2, model_version)
 
   # Helper function to compute population SD
  pop_sd_vec <- function(x) {
@@ -606,25 +590,18 @@ predict_rinet_2d <- function(data, feature_grid_range = c(-4, 4),
     all_stds <- stds
   }
 
-  # Stack and add channel dimension for batch prediction
-  features_array <- np$stack(all_features, axis = 0L)
-  features_array <- np$expand_dims(features_array, axis = -1L)
+  # Stack into (N, 1, H, W) for the model (channels-first)
+  features_array <- torch::torch_stack(
+    lapply(all_features, function(f) torch::torch_tensor(f, dtype = torch::torch_float32())),
+    dim = 1
+  )$unsqueeze(2)
 
   # Predict (single batch call for all samples + bootstraps)
-  predictions <- NULL
-  helpers <- tryCatch(get(".py_silence", envir = parent.env(environment()), inherits = TRUE), error = function(e) NULL)
-  if (!is.null(helpers)) {
-    predictions <- tryCatch(
-      helpers$predict_silent(model, features_array, verbose = verbose),
-      error = function(e) NULL
-    )
-  }
-  if (is.null(predictions)) {
-    predictions <- .silence_tf(model$predict(features_array, verbose = verbose))
-  }
+  predictions <- torch::with_no_grad(model(features_array))
+  predictions <- as.matrix(predictions)
 
-  # Inverse transform using scaler
-  predictions <- reticulate::py_to_r(scaler$inverse_transform(predictions))
+  # Inverse transform using scaler parameters
+  predictions <- .inverse_transform(predictions, 2, model_version)
 
   # Helper to compute scaled results from raw predictions
   compute_result <- function(pred_row, m, s) {
@@ -678,7 +655,8 @@ predict_rinet_2d <- function(data, feature_grid_range = c(-4, 4),
       correlation = res$correlation,
       reference_fraction = res$reference_fraction,
       reference_interval = res$reference_interval,
-      log_scale = log_scale
+      log_scale = log_scale,
+      model_version = model_version
     )
 
     # Add bootstrap CIs if requested
